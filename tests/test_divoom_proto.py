@@ -251,3 +251,39 @@ def test_build_animation_single_frame_timecode_bytes():
     raw = pkt.hex()
     # 500 in little-endian hex = f401
     assert 'f401' in raw
+
+
+# ---------------------------------------------------------------------------
+# build_command / build_show_clock  (SET_VIEW 0x45)
+# ---------------------------------------------------------------------------
+
+def test_build_command_framing():
+    pkt = proto.build_command(0x45, [0x00, 0x01])
+    assert pkt[0] == 0x01 and pkt[-1] == 0x02      # framing
+    assert pkt[3] == 0x45                            # cmd after lenLE(2)
+    # length field = len(args)+3 = 5
+    assert pkt[1] == 0x05 and pkt[2] == 0x00
+
+
+def test_build_show_clock_byte_layout():
+    pkt = proto.build_show_clock(clock_id=9, color=(255, 120, 0), twentyfour=True)
+    assert pkt[0] == 0x01 and pkt[-1] == 0x02
+    assert pkt[3] == proto.SET_VIEW                  # 0x45
+    # args begin at index 4: channel, clockId_lo, clockId_hi, 24h, ...
+    args = pkt[4:4 + 11]
+    assert args[0] == 0x00                            # clock channel
+    assert args[1] == 9 and args[2] == 0              # clock id (lo, hi)
+    assert args[3] == 0x01                            # 24h
+    assert args[7:10] == bytes([255, 120, 0])         # R,G,B orange
+
+
+def test_build_show_clock_color_changes_packet():
+    a = proto.build_show_clock(clock_id=9, color=(255, 120, 0))
+    b = proto.build_show_clock(clock_id=9, color=(255, 255, 255))
+    assert a != b
+
+
+def test_build_show_clock_id_changes_packet():
+    a = proto.build_show_clock(clock_id=9, color=(255, 120, 0))
+    b = proto.build_show_clock(clock_id=3, color=(255, 120, 0))
+    assert a != b

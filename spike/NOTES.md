@@ -60,3 +60,47 @@ cleanly; never SIGKILL mid-session.
    wait its duration, send idle.
 3. **Never SIGKILL mid-RFCOMM** — wedges the device's single SPP server (recover by
    power-cycle). Always close the channel and exit cleanly (watchdog -> clean exit).
+
+## CONFIRMED ON HARDWARE (2026-06-07) — daemon architecture
+
+- **IOBluetooth RFCOMM async callbacks are delivered ONLY on the runloop of the
+  thread that is running a CFRunLoop — in practice the MAIN thread.** A background
+  thread running `AppHelper.runConsoleEventLoop()` does NOT receive
+  `rfcommChannelOpenComplete` (open always times out). This is why the original
+  `transport.py` (background-thread runloop, mock-tested only) FAILS on hardware.
+  Proof: `spike/send_image2.py` and `spike/mainloop_test.py` (main-thread runloop)
+  open + write fine; `spike/seize_test.py`/`hold_test.py` (bg-thread runloop, via
+  the old transport) time out 100% even with `isConnected: False`.
+  => **Daemon shape:** MAIN thread owns the CFRunLoop; a background worker thread
+  reads the Unix socket and marshals BT ops onto main via `AppHelper.callAfter()`.
+  `writeSync_length_` works when marshaled onto the main runloop thread.
+
+- **`dev.closeConnection()` actively drops the macOS audio (A2DP/HFP) link and wins
+  the race.** Returns 0; `isConnected()` flips to False within ~0.3s. Immediately
+  calling `openRFCOMMChannelAsync` then succeeds (`status 0`) even though audio was
+  connected a moment earlier. => The daemon does NOT need power-cycle or manual audio
+  disconnect: on (re)connect, if `dev.isConnected()`, call `closeConnection()`,
+  sleep ~0.3s, then open RFCOMM. Validated end-to-end in `spike/mainloop_test.py`
+  (cycled 10 colors over ~40s on a held channel; clean close, exit 0).
+
+- **Tradeoff reaffirmed (SPP-only architecture, user-accepted):** holding the SPP
+  channel means the Ditoo is NOT available as a Mac audio output at the same time.
+  The daemon owns the channel; audio and Claude-status display are mutually exclusive.
+
+## CONFIRMED ON HARDWARE (2026-06-07) — return-to-clock
+
+- **The device does NOT auto-revert when the channel is released** — it keeps the
+  last pushed image (the pet keeps animating). To return to the clock we must
+  send an explicit SET_VIEW (0x45) command, THEN release the channel.
+- **SET_VIEW (0x45) arg order (verified):** `[0x00 channel=clock, clockId_lo,
+  clockId_hi, 24h, weather, temp, calendar, R, G, B, hot]`. The clock id comes
+  *right after* the channel byte (an earlier wrong order put the 24h flag there
+  and produced a generic clock at the wrong style/color).
+- **The user's clock = style id 9, color orange (255,120,0).** Sending
+  `build_show_clock(clock_id=9, color=(255,120,0))` then closing the channel
+  reproduces the user's normal clock exactly. A bare `[0x00]` restores the saved
+  style but forces white; supplying the id+color is required to get orange.
+- **Flush before close:** wait ~0.4–1.0s after sending the clock command before
+  closing the channel, so the write reaches the device (validated 1.0s).
+- **Daemon policy:** hold the channel only while ≥1 Claude session is active. On
+  the last SessionEnd, send the clock command and release (audio + clock return).

@@ -14,6 +14,7 @@ import math
 
 SET_IMAGE = 0x44
 SET_ANIMATION = 0x49
+SET_VIEW = 0x45      # switch the device view/channel (e.g. back to the clock)
 
 
 def checksum(payload: list) -> list:
@@ -106,6 +107,42 @@ def _make_frame(frame_body: list) -> list:
     """
     mf_len = len(frame_body) + 3
     return [0xAA] + list(mf_len.to_bytes(2, "little")) + frame_body
+
+
+def build_command(cmd: int, args: list) -> bytes:
+    """Build a generic on-wire command packet.
+
+    Layout mirrors build_static_image's framing: payload = lenLE(2) + cmd + args,
+    where length = len(args) + 3 (the +3 covers the cmd byte and the 2 checksum
+    bytes). Wrapped by make_message.
+    """
+    length = len(args) + 3
+    payload = list(length.to_bytes(2, "little")) + [cmd & 0xFF] + list(args)
+    return make_message(payload)
+
+
+def build_show_clock(clock_id: int = 0xFF, twentyfour: bool = True,
+                     weather: bool = False, temp: bool = False,
+                     calendar: bool = False, color=(255, 255, 255),
+                     hot: bool = False) -> bytes:
+    """Switch the device to its clock face (SET_VIEW, channel 0x00 = clock).
+
+    Returns the device to its default clock when no Claude session is active.
+    clock_id 0xFF = keep the device's currently-selected clock style.
+    Ported from hass-divoom's show_clock argument layout.
+    """
+    r, g, b = color
+    args = [
+        0x00,                                     # view channel: 0x00 = clock
+        clock_id & 0xFF, (clock_id >> 8) & 0xFF,  # clock style id (right after channel)
+        0x01 if twentyfour else 0x00,             # 24-hour format
+        0x01 if weather else 0x00,
+        0x01 if temp else 0x00,
+        0x01 if calendar else 0x00,
+        r & 0xFF, g & 0xFF, b & 0xFF,
+        0x01 if hot else 0x00,
+    ]
+    return build_command(SET_VIEW, args)
 
 
 def build_static_image(grid: list) -> bytes:

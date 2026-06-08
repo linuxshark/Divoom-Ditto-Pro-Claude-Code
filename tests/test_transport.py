@@ -20,11 +20,6 @@ from transport import Transport, MockTransport, IOBluetoothTransport
 # ---------------------------------------------------------------------------
 
 class TestTransportBase:
-    def test_connect_raises(self):
-        t = Transport()
-        with pytest.raises(NotImplementedError):
-            t.connect()
-
     def test_send_raises(self):
         t = Transport()
         with pytest.raises(NotImplementedError):
@@ -98,6 +93,42 @@ class TestMockTransport:
         m.connect()
         m.send(b"")
         assert m.sent == [b""]
+
+    # Daemon-shaped API
+    def test_start_connects_and_fires_on_ready(self):
+        m = MockTransport()
+        calls = []
+        m.start(on_ready=lambda: calls.append("ready"))
+        assert m.connected is True
+        assert m.is_ready is True
+        assert calls == ["ready"]
+
+    def test_wait_ready_true_after_start(self):
+        m = MockTransport()
+        m.start()
+        assert m.wait_ready(0.1) is True
+
+    def test_stop_disconnects(self):
+        m = MockTransport()
+        m.start()
+        m.stop()
+        assert m.connected is False
+        assert m.is_ready is False
+
+    def test_run_forever_unblocks_on_stop(self):
+        import threading as _t
+        m = MockTransport()
+        m.start()
+        done = _t.Event()
+
+        def runner():
+            m.run_forever()
+            done.set()
+
+        _t.Thread(target=runner, daemon=True).start()
+        assert not done.wait(0.2)  # blocks while running
+        m.stop()
+        assert done.wait(1.0)      # unblocks after stop
 
 
 # ---------------------------------------------------------------------------

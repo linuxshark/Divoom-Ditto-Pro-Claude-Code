@@ -8,19 +8,25 @@ Three classes:
 Only IOBluetoothTransport imports IOBluetooth/PyObjC; the other two are
 pure Python and importable on any platform.
 
-Hardware notes (from spike/NOTES.md and spike/send_image2.py):
-- Use openRFCOMMChannelAsync (NOT sync — sync returns kIOReturnError).
-- Do NOT call dev.openConnection() first.
-- The channel open completes via rfcommChannelOpenComplete_status_ delegate cb.
-- Delegate + run loop MUST live on a dedicated background thread.
-- Send with channel.writeSync_length_() from any thread while run loop is alive.
-- Close cleanly with channel.closeChannel() — never SIGKILL mid-RFCOMM.
+Hardware-verified architecture (spike/NOTES.md, spike/mainloop_test.py):
+- Transport is Bluetooth Classic RFCOMM/SPP, channel 2, async open only
+  (sync open returns kIOReturnError).
+- IOBluetooth delivers RFCOMM delegate callbacks ONLY on the thread running the
+  CFRunLoop — in practice the MAIN thread. So:
+    * The OWNER runs run_forever() on its MAIN thread.
+    * start()/send()/stop() marshal the actual BT calls onto that runloop via
+      AppHelper.callAfter/callLater and are safe to call from a worker thread.
+- macOS aggressively reconnects the Ditoo as an audio device, which blocks
+  RFCOMM. dev.closeConnection() drops that audio link (returns 0); opening RFCOMM
+  immediately after then succeeds. This is the SPP-only tradeoff: while we hold
+  the channel the Ditoo is NOT a Mac audio output.
+- Never SIGKILL mid-RFCOMM (wedges the device SPP server; recover by power-cycle).
 """
 
 from __future__ import annotations
 
 import threading
-from typing import Optional
+from typing import Callable, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -28,10 +34,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 class Transport:
-    """Abstract transport base. Subclasses implement connect/send/close."""
-
-    def connect(self) -> None:
-        raise NotImplementedError
+    """Abstract transport base. Subclasses implement send."""
 
     def send(self, packet: bytes) -> None:
         raise NotImplementedError
@@ -47,15 +50,22 @@ class Transport:
 class MockTransport(Transport):
     """In-process fake transport.  Usable on any platform, no hardware needed.
 
+    Mirrors the IOBluetoothTransport API the daemon uses (start/run_forever/
+    send/stop/wait_ready) plus a simple connect() for direct unit tests.
+
     Attributes:
-        connected (bool): True after connect(), False after close().
+        connected (bool): True after connect()/start(), False after close()/stop().
         sent (list[bytes]): All packets passed to send(), in order.
     """
 
     def __init__(self) -> None:
         self.connected: bool = False
         self.sent: list[bytes] = []
+        self._stop_evt = threading.Event()
+        self.on_ready: Optional[Callable[[], None]] = None
+        self.on_closed: Optional[Callable[[], None]] = None
 
+    # Simple API (direct tests)
     def connect(self) -> None:
         self.connected = True
 
@@ -66,139 +76,268 @@ class MockTransport(Transport):
 
     def close(self) -> None:
         self.connected = False
+        self._stop_evt.set()
+
+    # Daemon-shaped API
+    def start(
+        self,
+        on_ready: Optional[Callable[[], None]] = None,
+        on_closed: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self.on_ready = on_ready
+        self.on_closed = on_closed
+        self.connected = True
+        if on_ready is not None:
+            on_ready()
+
+    def run_forever(self) -> None:
+        self._stop_evt.wait()
+
+    def stop(self) -> None:
+        self.close()
+
+    def wait_ready(self, timeout: Optional[float] = None) -> bool:
+        return self.connected
+
+    @property
+    def is_ready(self) -> bool:
+        return self.connected
 
 
 # ---------------------------------------------------------------------------
-# Real macOS transport
+# Real macOS transport (main-runloop model)
 # ---------------------------------------------------------------------------
+
+# Cached ObjC delegate class. Built once on first use — an ObjC class name can
+# only be registered with the runtime once per process, so defining it inside a
+# method breaks on the second instance ("overriding existing Objective-C class").
+_DELEGATE_CLASS = None
+
+
+def _get_delegate_class():
+    global _DELEGATE_CLASS
+    if _DELEGATE_CLASS is not None:
+        return _DELEGATE_CLASS
+
+    from Foundation import NSObject  # type: ignore
+
+    class _RFCOMMDelegate(NSObject):  # type: ignore
+        # `transport` is attached after alloc().init() by the caller.
+        def rfcommChannelOpenComplete_status_(self, ch, status):  # noqa: N805
+            t = self.transport
+            if status == 0:
+                t._channel = ch
+                t._ready.set()
+                if t._on_ready is not None:
+                    try:
+                        t._on_ready()
+                    except Exception:
+                        pass
+            else:
+                t._channel = None
+                t._open_error = ConnectionError(
+                    f"RFCOMM open failed with status {status}"
+                )
+                t._ready.set()
+                t._stop_loop()  # let run_forever() return so the owner can retry
+
+        def rfcommChannelData_data_length_(self, ch, data, length):  # noqa: N805
+            pass  # RX data (ACKs) — ignored at transport layer
+
+        def rfcommChannelClosed_(self, ch):  # noqa: N805
+            t = self.transport
+            t._channel = None
+            t._ready.clear()
+            if t._on_closed is not None:
+                try:
+                    t._on_closed()
+                except Exception:
+                    pass
+            # Stop the run loop so the owner's start()/run_forever() cycle can
+            # re-open the channel synchronously (open delivers its callback only
+            # when initiated outside a running loop — see NOTES.md).
+            if not t._stopping:
+                t._stop_loop()
+
+    _DELEGATE_CLASS = _RFCOMMDelegate
+    return _DELEGATE_CLASS
+
 
 class IOBluetoothTransport(Transport):
-    """Bluetooth RFCOMM transport using PyObjC IOBluetooth (macOS only).
+    """RFCOMM transport using PyObjC IOBluetooth (macOS only), main-runloop model.
 
-    The IOBluetooth API is CoreFoundation run-loop + delegate based.  To keep
-    that complexity off the caller's thread (plain Python or asyncio), this
-    class owns a *daemon background thread* that:
-      1. Creates an NSObject delegate.
-      2. Calls openRFCOMMChannelAsync_withChannelID_delegate_().
-      3. Runs AppHelper.runConsoleEventLoop() — the CF run loop.
+    Usage (in the owner):
+        t = IOBluetoothTransport(MAC)
+        t.start(on_ready=..., on_closed=...)   # main thread, non-blocking
+        # ... start a worker thread that waits on t.wait_ready() then t.send() ...
+        t.run_forever()                        # main thread, blocks (CFRunLoop)
 
-    connect() blocks (with a timeout) on a threading.Event that the delegate
-    sets when rfcommChannelOpenComplete_status_ fires.
-
-    send() calls channel.writeSync_length_() directly — IOBluetooth allows
-    this from a non-run-loop thread while the channel is alive.
-
-    close() sends closeChannel() on the run loop thread via AppHelper.callAfter
-    then stops the run loop, and joins the background thread.
+    start()/send()/reopen()/stop() are safe to call from any thread; they marshal
+    the real BT calls onto the main CFRunLoop.
     """
+
+    SETTLE_AFTER_AUDIO_CLOSE = 0.4  # seconds between closeConnection() and open
 
     def __init__(self, mac: str, channel: int = 2, open_timeout: float = 15.0) -> None:
         self._mac = mac
         self._channel_id = channel
         self._open_timeout = open_timeout
 
-        self._channel = None          # set by delegate on open complete
-        self._connect_error: Optional[Exception] = None
-        self._open_event = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
-
-    def connect(self) -> None:
-        """Open the RFCOMM channel.  Blocks until open or timeout."""
-        # Import here so other modules don't require PyObjC.
-        from IOBluetooth import IOBluetoothDevice  # type: ignore
-        from PyObjCTools import AppHelper          # type: ignore
-        from Foundation import NSObject            # type: ignore
-
-        self._open_event.clear()
         self._channel = None
-        self._connect_error = None
+        self._delegate = None
+        self._stopping = False
+        self._ready = threading.Event()
+        self._open_error: Optional[Exception] = None
+        self._on_ready: Optional[Callable[[], None]] = None
+        self._on_closed: Optional[Callable[[], None]] = None
 
-        # Build the delegate class inside connect() so NSObject is available.
-        transport_self = self  # closure ref
+    # ------------------------------------------------------------------
+    # Run loop control (MAIN thread)
+    # ------------------------------------------------------------------
 
-        class _RFCOMMDelegate(NSObject):  # type: ignore
-            def rfcommChannelOpenComplete_status_(self_d, ch, status):  # noqa: N805
-                if status == 0:
-                    transport_self._channel = ch
-                else:
-                    transport_self._connect_error = ConnectionError(
-                        f"RFCOMM open failed with status {status}"
-                    )
-                transport_self._open_event.set()
+    def run_forever(self) -> None:
+        """Run the CoreFoundation run loop on the MAIN thread. Returns when the
+        channel closes, the open fails, the open times out, or stop() is called —
+        so the owner can retry start()/run_forever() with backoff, or exit."""
+        from PyObjCTools import AppHelper  # type: ignore
+        AppHelper.runConsoleEventLoop()
 
-            def rfcommChannelData_data_length_(self_d, ch, data, length):  # noqa: N805
-                pass  # RX data — ignored at transport layer
+    def _stop_loop(self) -> None:
+        from PyObjCTools import AppHelper  # type: ignore
+        try:
+            AppHelper.stopEventLoop()
+        except Exception:
+            pass
 
-            def rfcommChannelClosed_(self_d, ch):  # noqa: N805
-                # Channel closed by remote or error; clear our ref.
-                if transport_self._channel is ch:
-                    transport_self._channel = None
+    def stop(self) -> None:
+        """Permanently stop: mark stopping, close the channel, stop the loop.
+        Safe from any thread."""
+        self._stopping = True
+        from PyObjCTools import AppHelper  # type: ignore
+        AppHelper.callAfter(self._do_stop)
 
-        def _run_loop():
-            dev = IOBluetoothDevice.deviceWithAddressString_(self._mac)
-            delegate = _RFCOMMDelegate.alloc().init()
-            # Keep delegate alive for the lifetime of the thread.
-            _run_loop._delegate = delegate  # type: ignore[attr-defined]
+    # ------------------------------------------------------------------
+    # Open
+    # ------------------------------------------------------------------
 
-            dev.openRFCOMMChannelAsync_withChannelID_delegate_(
-                None, self._channel_id, delegate
+    def start(
+        self,
+        on_ready: Optional[Callable[[], None]] = None,
+        on_closed: Optional[Callable[[], None]] = None,
+    ) -> None:
+        """Initiate an RFCOMM open and arm the open watchdog. Call on the MAIN
+        thread, then call run_forever().
+
+        The open is initiated synchronously here (outside the running loop)
+        because IOBluetooth only delivers the open-complete callback for opens
+        initiated *outside* a running CFRunLoop — confirmed on hardware (see
+        spike/NOTES.md). Reconnects therefore use a fresh start()/run_forever()
+        cycle rather than reopening inside the live loop.
+        """
+        from PyObjCTools import AppHelper  # type: ignore
+        self._on_ready = on_ready
+        self._on_closed = on_closed
+        self._stopping = False
+        self._channel = None
+        self._ready.clear()
+        self._open_error = None
+        self._close_audio_then_open()
+        # Watchdog fires inside run_forever(); stops the loop if not open in time.
+        AppHelper.callLater(self._open_timeout, self._open_watchdog)
+
+    def _open_watchdog(self) -> None:
+        if self._channel is None and not self._stopping:
+            self._open_error = ConnectionError(
+                f"RFCOMM open timed out after {self._open_timeout}s "
+                f"(device off / out of range / audio re-grabbed the link)"
             )
-            # Blocks until AppHelper.stopEventLoop() or os._exit().
-            AppHelper.runConsoleEventLoop()
+            self._ready.set()
+            self._stop_loop()
 
-        self._thread = threading.Thread(target=_run_loop, daemon=True, name="iobluetooth-runloop")
-        self._thread.start()
+    def _close_audio_then_open(self) -> None:
+        import time
+        from IOBluetooth import IOBluetoothDevice  # type: ignore
 
-        # Block until delegate fires or we time out.
-        fired = self._open_event.wait(timeout=self._open_timeout)
-        if not fired:
-            # Attempt a clean stop before raising.
-            self._stop_runloop()
-            raise ConnectionError(
-                f"Timed out waiting for RFCOMM open after {self._open_timeout}s "
-                f"(device may be audio-connected — disconnect audio and retry)"
+        dev = IOBluetoothDevice.deviceWithAddressString_(self._mac)
+        if dev.isConnected():
+            # Drop the macOS audio (A2DP/HFP) link so RFCOMM can open; a brief
+            # settle then keeps the open on this thread (registers on main loop).
+            dev.closeConnection()
+            time.sleep(self.SETTLE_AFTER_AUDIO_CLOSE)
+        self._do_open()
+
+    def _do_open(self) -> None:
+        # runs on the main run loop thread
+        from IOBluetooth import IOBluetoothDevice  # type: ignore
+
+        dev = IOBluetoothDevice.deviceWithAddressString_(self._mac)
+        delegate = _get_delegate_class().alloc().init()
+        delegate.transport = self
+        self._delegate = delegate  # keep alive
+        res = dev.openRFCOMMChannelAsync_withChannelID_delegate_(
+            None, self._channel_id, delegate
+        )
+        code = res[0] if isinstance(res, tuple) else res
+        if code != 0:
+            self._open_error = ConnectionError(
+                f"openRFCOMMChannelAsync returned {code}"
             )
-        if self._connect_error is not None:
-            self._stop_runloop()
-            raise self._connect_error
+            self._ready.set()
+
+    def wait_ready(self, timeout: Optional[float] = None) -> bool:
+        """Block (off the run loop) until the channel is open. Returns True if
+        open, False on timeout. Raises if the open errored."""
+        if timeout is None:
+            timeout = self._open_timeout
+        ok = self._ready.wait(timeout)
+        if self._open_error is not None:
+            err = self._open_error
+            self._open_error = None
+            raise err
+        return ok and self._channel is not None
+
+    @property
+    def is_ready(self) -> bool:
+        return self._channel is not None
+
+    # ------------------------------------------------------------------
+    # Send
+    # ------------------------------------------------------------------
 
     def send(self, packet: bytes) -> None:
-        """Write packet bytes to the RFCOMM channel (synchronous)."""
+        """Write packet bytes to the channel. Safe from any thread; the write is
+        marshaled onto the run loop. Raises if not currently open."""
         if self._channel is None:
-            raise ConnectionError("IOBluetoothTransport: not connected (channel is None)")
-        result = self._channel.writeSync_length_(packet, len(packet))
-        if result != 0:
-            raise ConnectionError(f"writeSync_length_ returned {result}")
+            raise ConnectionError("IOBluetoothTransport: not connected")
+        from PyObjCTools import AppHelper  # type: ignore
+        AppHelper.callAfter(self._do_send, packet)
 
-    def close(self) -> None:
-        """Close the RFCOMM channel and stop the run loop. Safe to call when not connected."""
+    def _do_send(self, packet: bytes) -> None:
+        # runs on the main run loop thread
+        ch = self._channel
+        if ch is None:
+            return
+        ch.writeSync_length_(packet, len(packet))
+
+    # ------------------------------------------------------------------
+    # Internal
+    # ------------------------------------------------------------------
+
+    def _do_stop(self) -> None:
+        from PyObjCTools import AppHelper  # type: ignore
         ch = self._channel
         self._channel = None
-
+        self._ready.clear()
         if ch is not None:
             try:
                 ch.closeChannel()
             except Exception:
                 pass
-
-        self._stop_runloop()
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
-    def _stop_runloop(self) -> None:
-        """Stop the CoreFoundation run loop on the background thread and join it."""
-        if self._thread is None or not self._thread.is_alive():
-            return
         try:
-            from PyObjCTools import AppHelper  # type: ignore
             AppHelper.stopEventLoop()
         except Exception:
             pass
-        self._thread.join(timeout=3.0)
-        self._thread = None
+
+    def close(self) -> None:
+        """Alias for stop() to satisfy the Transport base contract."""
+        self.stop()

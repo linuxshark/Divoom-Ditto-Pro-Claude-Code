@@ -10,6 +10,18 @@
 
 ---
 
+## ⚠️ Phase 0 RESULTS — validated on hardware 2026-06-06 (these SUPERSEDE the prose below)
+
+Phase 0 ran against the real device (`DitooPro-Audio-RL`, MAC `b1-21-81-8c-c0-b5`). A solid-red frame rendered end-to-end. The full record is in `spike/NOTES.md`; the tested reference code is `spike/divoom_pkt.py` (protocol) and `spike/send_image2.py` (transport). Where this section and the prose below disagree, **this section and `spike/NOTES.md` win.**
+
+Binding facts for implementation:
+- **Transport:** PyObjC IOBluetooth, **async** open `openRFCOMMChannelAsync_withChannelID_delegate_` on **RFCOMM channel 2** + a delegate + `AppHelper.runConsoleEventLoop()`. The **sync** API returns `kIOReturnError` — do not use it. Do **not** call `openConnection()` first; open the RFCOMM channel directly. Send with `channel.writeSync_length_(packet, len(packet))`.
+- **RFCOMM opens only when the device is not actively audio-connected** (`isConnected()` False). The daemon opens the channel once and holds it; reconnect with backoff (audio auto-reconnect can transiently block).
+- **Protocol (Ditoo, `screensize=16`, escaping OFF):** static image cmd `0x44`, animation cmd `0x49`. Exact byte layout is in `spike/divoom_pkt.py` (`build_static_image`) — it includes the `make_framepart` fixed header `[0x00,0x0A,0x0A,0x04]`, the `0xAA`+len `make_frame` wrapper, timeCode/paletteFlag bytes, palette-indexed pixels (`process_pixels`), and `checksum = sum(payload)` 2-byte LE. The earlier `encode_image` in Phase 1 below is a simplification and is **wrong** — port `spike/divoom_pkt.py` instead.
+- **Device self-animates:** send a multi-frame animation ONCE via `0x49` (chunked at 200 bytes, per-frame timeCode durations); the device loops it. **There is no per-frame fps push loop.** The daemon sends one buffer per state change. `done → idle` is a daemon timer (send done, wait its duration, send idle). This replaces the render-loop design in Phase 3.
+
+---
+
 ## Validation Summary (read before implementing)
 
 The approved design spec (`docs/superpowers/specs/2026-06-06-ditoo-claude-integration-design.md`) is **architecturally coherent but not viable as written**. The hook → socket → daemon → device pattern is sound and is kept. Three assumptions are wrong and are corrected by this plan:
